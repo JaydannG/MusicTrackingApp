@@ -1,67 +1,88 @@
 import { createClient } from '@supabase/supabase-js'
 import { NextRequest, NextResponse } from 'next/server'
+import { normalize } from 'path'
 
 const supabase = createClient(
-  process.env.NEXT_PUBLIC_SUPABASE_URL!,
-  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
 )
 
+function normalizeDate(date: string): string {
+  if (!date) return date;
+  if (/^\d{4}$/.test(date)) return `${date}-01-01`;
+  if (/^\d{4}-\d{2}$/.test(date)) return `${date}-01`;
+  return date;
+}
+
 export async function POST(req: NextRequest) {
-  const body = await req.json()
-  const {
-    spotify_id, title, artist, cover_art_url,
-    release_date, album_type, total_duration_ms,
-    tracks, genres, rating, review, listen_date
-  } = body
+    const body = await req.json()
+    const {
+        spotify_id, title, artist, cover_art_url,
+        release_date, album_type, total_duration_ms,
+        tracks, genres, rating, review, start_date, finish_date
+    } = body
 
-  // 1. Upsert album (insert or update if spotify_id already exists)
-  const { data: album, error: albumError } = await supabase
-    .from('albums')
-    .upsert({ spotify_id, title, artist, cover_art_url, release_date, album_type, total_duration_ms },
-      { onConflict: 'spotify_id' })
-    .select()
-    .single()
-
-  if (albumError) return NextResponse.json({ error: albumError.message }, { status: 500 })
-
-  // 2. Insert tracks (delete existing first to avoid duplicates)
-  await supabase.from('tracks').delete().eq('album_id', album.id)
-  const trackRows = tracks.map((t: any) => ({ album_id: album.id, ...t }))
-  await supabase.from('tracks').insert(trackRows)
-
-  // 3. Handle genres
-  for (const genreName of genres) {
-    // Get or create genre
-    let { data: genre } = await supabase
-      .from('genres')
-      .select()
-      .eq('name', genreName.toLowerCase())
-      .single()
-
-    if (!genre) {
-      const { data: newGenre } = await supabase
-        .from('genres')
-        .insert({ name: genreName.toLowerCase() })
+    // 1. Upsert album
+    const { data: album, error: albumError } = await supabase
+        .from('albums')
+        .upsert(
+            { spotify_id, title, artist, cover_art_url, release_date: normalizeDate(release_date), album_type, total_duration_ms },
+            { onConflict: 'spotify_id' }
+        )
         .select()
         .single()
-      genre = newGenre
+
+    if (albumError) return NextResponse.json({ error: albumError.message }, { status: 500 })
+
+    // 2. Insert tracks (replace existing)
+    await supabase.from('tracks').delete().eq('album_id', album.id)
+    await supabase.from('tracks').insert(
+        tracks.map((t: any) => ({ album_id: album.id, ...t }))
+    )
+
+    // 3. Handle genres
+    console.log("genres to save:", genres)
+    for (const genreName of genres) {
+        console.log("processing genre:", genreName)
+        const normalized = genreName.toLowerCase()
+
+        const { data: existingGenre } = await supabase
+            .from('genres')
+            .select()
+            .eq('name', normalized)
+            .maybeSingle()
+
+        let genreId: number
+
+        if (existingGenre) {
+            genreId = existingGenre.id
+            console.log("found existing genre:", genreId)
+        } else {
+            const { data: newGenre, error: genreError } = await supabase
+                .from('genres')
+                .insert({ name: normalized })
+                .select()
+                .single()
+            if (genreError || !newGenre) {
+                console.log("failed to insert genre:", genreError)
+                continue
+            }
+            genreId = newGenre.id
+            console.log("inserted new genre:", genreId)
+        }
+
+        const { error: linkError } = await supabase
+            .from('album_genres')
+            .insert({ album_id: album.id, genre_id: genreId })
+        console.log("linked genre result:", linkError)
     }
 
-    // Link genre to album if not already linked
-    if (genre) {
-      await supabase
-        .from('album_genres')
-        .upsert({ album_id: album.id, genre_id: genre.id },
-          { onConflict: 'album_id,genre_id' })
-    }
-  }
+    // 4. Create log entry
+    const { error: logError } = await supabase
+        .from('logs')
+        .insert({ album_id: album.id, rating, review, start_date, finish_date })
 
-  // 4. Create log entry
-  const { error: logError } = await supabase
-    .from('logs')
-    .insert({ album_id: album.id, rating, review, listen_date })
+    if (logError) return NextResponse.json({ error: logError.message }, { status: 500 })
 
-  if (logError) return NextResponse.json({ error: logError.message }, { status: 500 })
-
-  return NextResponse.json({ success: true })
+    return NextResponse.json({ success: true })
 }
